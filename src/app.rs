@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollDelta, ScrollWheelEvent, Styled, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Task, Timer,
+    Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 
 use crate::CellCoord;
@@ -18,6 +20,10 @@ struct AppView {
     camera: Camera,
     tile_views: HashMap<RenderTileCoord, Entity<TileView>>,
     pointer_mode: Option<PointerMode>,
+    running: bool,
+    timer_task: Option<Task<()>>,
+    speed: u16,
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +40,7 @@ enum PointerMode {
 const MIN_CELL_SIZE: f64 = 0.0625;
 const MAX_CELL_SIZE: f64 = 128.0;
 const PIXELS_PER_SCROLL_LINE: f64 = 40.0;
+const TOOLBAR_HEIGHT: f64 = 48.0;
 
 impl AppView {
     fn new() -> Self {
@@ -47,6 +54,111 @@ impl AppView {
                 .expect("initial camera scale is valid"),
             tile_views: HashMap::new(),
             pointer_mode: None,
+            running: false,
+            timer_task: None,
+            speed: 10,
+            generation: 0,
+        }
+    }
+
+    fn toggle_running(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            self.pause(cx);
+        } else {
+            self.start(cx);
+        }
+    }
+
+    fn start(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        self.running = true;
+        let timer_task = cx.spawn(async move |this, cx| {
+            loop {
+                let Some(speed) = this
+                    .update(cx, |view, _| view.running.then_some(view.speed))
+                    .ok()
+                    .flatten()
+                else {
+                    break;
+                };
+                Timer::after(generation_period(speed)).await;
+                let should_continue = this
+                    .update(cx, |view, cx| {
+                        if !view.running {
+                            return false;
+                        }
+                        view.step(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        });
+        self.timer_task = Some(timer_task);
+        cx.notify();
+    }
+
+    fn pause(&mut self, cx: &mut Context<Self>) {
+        self.running = false;
+        self.timer_task = None;
+        cx.notify();
+    }
+
+    fn step(&mut self, cx: &mut Context<Self>) {
+        self.world = crate::simulation::next_generation(&self.world).0;
+        self.generation = self.generation.saturating_add(1);
+        cx.notify();
+    }
+
+    fn clear(&mut self, cx: &mut Context<Self>) {
+        self.pause_without_notify();
+        self.world = World::new();
+        self.generation = 0;
+        cx.notify();
+    }
+
+    fn randomize(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.pause_without_notify();
+        let viewport_size = window.viewport_size();
+        let center = self.camera.screen_to_cell(
+            f64::from(viewport_size.width) / 2.0,
+            (f64::from(viewport_size.height) - TOOLBAR_HEIGHT) / 2.0,
+        );
+        if let Some(center) = center {
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            self.world = randomized_world(center, seed);
+            self.generation = 0;
+        }
+        cx.notify();
+    }
+
+    fn pause_without_notify(&mut self) {
+        self.running = false;
+        self.timer_task = None;
+    }
+
+    fn change_speed(&mut self, increase: bool, cx: &mut Context<Self>) {
+        let next = if increase {
+            self.speed.saturating_add(5).min(120)
+        } else {
+            self.speed.saturating_sub(5).max(1)
+        };
+        if next != self.speed {
+            self.speed = next;
+            if self.running {
+                self.running = false;
+                self.timer_task = None;
+                self.start(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
@@ -126,7 +238,7 @@ impl AppView {
         if new_cell_size != self.camera.cell_size()
             && self.camera.zoom_about(
                 f64::from(event.position.x),
-                f64::from(event.position.y),
+                f64::from(event.position.y) - TOOLBAR_HEIGHT,
                 new_cell_size,
             )
         {
@@ -135,8 +247,10 @@ impl AppView {
     }
 
     fn screen_to_cell(&self, position: gpui::Point<gpui::Pixels>) -> Option<CellCoord> {
-        self.camera
-            .screen_to_cell(f64::from(position.x), f64::from(position.y))
+        self.camera.screen_to_cell(
+            f64::from(position.x),
+            f64::from(position.y) - TOOLBAR_HEIGHT,
+        )
     }
 
     fn prepare_tiles(&mut self, plan: &RenderPlan, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -232,48 +346,168 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_size = window.viewport_size();
         let width = f64::from(viewport_size.width);
-        let height = f64::from(viewport_size.height);
+        let height = (f64::from(viewport_size.height) - TOOLBAR_HEIGHT).max(1.0);
         let tiles = plan_visible_tiles(self.camera, width, height, DEFAULT_OVERSCAN_CHUNKS)
             .map(|plan| self.prepare_tiles(&plan, cx))
             .unwrap_or_default();
 
         div()
             .size_full()
-            .relative()
-            .overflow_hidden()
+            .flex()
+            .flex_col()
             .bg(rgb(0x111827))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, _, cx| this.begin_paint(event, cx)),
+            .child(
+                div()
+                    .h(px(TOOLBAR_HEIGHT as f32))
+                    .w_full()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .bg(rgb(0x1f2937))
+                    .child(control_button(
+                        "run-toggle",
+                        if self.running { "Pause" } else { "Start" },
+                        cx.listener(|this, _, _, cx| this.toggle_running(cx)),
+                    ))
+                    .child(control_button(
+                        "step",
+                        "Step",
+                        cx.listener(|this, _, _, cx| this.step(cx)),
+                    ))
+                    .child(control_button(
+                        "clear",
+                        "Clear",
+                        cx.listener(|this, _, _, cx| this.clear(cx)),
+                    ))
+                    .child(control_button(
+                        "randomize",
+                        "Randomize",
+                        cx.listener(|this, _, window, cx| this.randomize(window, cx)),
+                    ))
+                    .child(
+                        div()
+                            .text_color(gpui::white())
+                            .child(format!("世代 {}", self.generation)),
+                    )
+                    .child(
+                        div()
+                            .text_color(gpui::white())
+                            .child(format!("{} 世代/秒", self.speed)),
+                    )
+                    .child(control_button(
+                        "speed-down",
+                        "−",
+                        cx.listener(|this, _, _, cx| this.change_speed(false, cx)),
+                    ))
+                    .child(control_button(
+                        "speed-up",
+                        "+",
+                        cx.listener(|this, _, _, cx| this.change_speed(true, cx)),
+                    )),
             )
-            .on_mouse_down(
-                MouseButton::Middle,
-                cx.listener(|this, event: &MouseDownEvent, _, _| this.begin_pan(event)),
+            .child(
+                div()
+                    .flex_1()
+                    .relative()
+                    .overflow_hidden()
+                    .bg(rgb(0x111827))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.begin_paint(event, cx)
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(|this, event: &MouseDownEvent, _, _| this.begin_pan(event)),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.end_pointer(MouseButton::Left)
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.end_pointer(MouseButton::Left)
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.end_pointer(MouseButton::Middle)
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Middle,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.end_pointer(MouseButton::Middle)
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.pointer_move(event, cx)
+                    }))
+                    .on_scroll_wheel(
+                        cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.zoom(event, cx)),
+                    )
+                    .children(tiles),
             )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Left)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Left)),
-            )
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Middle)),
-            )
-            .on_mouse_up_out(
-                MouseButton::Middle,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Middle)),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.pointer_move(event, cx)),
-            )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.zoom(event, cx)),
-            )
-            .children(tiles)
     }
+}
+
+fn control_button(
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .flex_none()
+        .px_3()
+        .py_1()
+        .bg(rgb(0x374151))
+        .text_color(gpui::white())
+        .rounded_sm()
+        .cursor_pointer()
+        .child(label)
+        .on_click(on_click)
+}
+
+fn randomized_world(center: CellCoord, mut state: u64) -> World {
+    if state == 0 {
+        state = 0x9e37_79b9_7f4a_7c15;
+    }
+    let mut world = World::new();
+    for y in 0..64_i128 {
+        for x in 0..64_i128 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if state & 0b11 == 0 {
+                let Some(cell_x) = i64::try_from(i128::from(center.x) + x - 32).ok() else {
+                    continue;
+                };
+                let Some(cell_y) = i64::try_from(i128::from(center.y) + y - 32).ok() else {
+                    continue;
+                };
+                world.set(
+                    CellCoord {
+                        x: cell_x,
+                        y: cell_y,
+                    },
+                    true,
+                );
+            }
+        }
+    }
+    world
+}
+
+fn generation_period(speed: u16) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(speed.clamp(1, 120)))
 }
 
 pub fn run() {
@@ -454,5 +688,26 @@ mod tests {
         assert!(zoomed_cell_size(8.0, -1.0) > 8.0);
         assert_eq!(zoomed_cell_size(8.0, 100.0), MIN_CELL_SIZE);
         assert_eq!(zoomed_cell_size(8.0, -100.0), MAX_CELL_SIZE);
+    }
+
+    #[test]
+    fn randomize_is_repeatable_for_a_seed_and_fills_the_world() {
+        let center = CellCoord { x: -10, y: 20 };
+        let first = randomized_world(center, 1234);
+        let second = randomized_world(center, 1234);
+        let different = randomized_world(center, 5678);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert!(!first.is_empty());
+    }
+
+    #[test]
+    fn simulation_period_stays_within_the_configured_speed_range() {
+        assert_eq!(generation_period(1), Duration::from_secs(1));
+        assert!(generation_period(120) >= Duration::from_millis(8));
+        assert!(generation_period(120) < Duration::from_millis(9));
+        assert_eq!(generation_period(0), Duration::from_secs(1));
+        assert_eq!(generation_period(121), generation_period(120));
     }
 }
