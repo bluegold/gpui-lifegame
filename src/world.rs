@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use crate::chunk::Chunk;
+use crate::coords::{MAX_CHUNK_COORD, MIN_CHUNK_COORD, split_cell_coord};
 use crate::{CellCoord, ChunkCoord};
-use crate::{chunk::Chunk, coords::split_cell_coord};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct World {
@@ -63,6 +64,17 @@ impl World {
         self.chunks.get(&coord)
     }
 
+    pub(crate) fn insert_chunk(&mut self, coord: ChunkCoord, chunk: Chunk) {
+        debug_assert!((MIN_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&coord.0));
+        debug_assert!((MIN_CHUNK_COORD..=MAX_CHUNK_COORD).contains(&coord.1));
+
+        if chunk.is_empty() {
+            self.chunks.remove(&coord);
+        } else {
+            self.chunks.insert(coord, chunk);
+        }
+    }
+
     pub fn chunks(&self) -> impl Iterator<Item = (ChunkCoord, &Chunk)> {
         self.chunks.iter().map(|(coord, chunk)| (*coord, chunk))
     }
@@ -79,8 +91,6 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coords::{MAX_CHUNK_COORD, MIN_CHUNK_COORD};
-
     fn cell(x: i64, y: i64) -> CellCoord {
         CellCoord { x, y }
     }
