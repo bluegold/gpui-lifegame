@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use crate::chunk::Chunk;
 use crate::coords::{MAX_CHUNK_COORD, MIN_CHUNK_COORD};
@@ -12,9 +13,22 @@ pub struct GenerationDelta {
     pub removed_chunks: Vec<ChunkCoord>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GenerationStats {
+    pub candidate_chunks: usize,
+    pub elapsed: Duration,
+}
+
 /// Computes one generation without modifying `current`.
 pub fn next_generation(current: &World) -> (World, GenerationDelta) {
+    let (next, delta, _) = next_generation_with_stats(current);
+    (next, delta)
+}
+
+pub fn next_generation_with_stats(current: &World) -> (World, GenerationDelta, GenerationStats) {
+    let started = Instant::now();
     let candidates = candidate_chunks(current);
+    let candidate_count = candidates.len();
     let mut next = World::new();
 
     for (chunk_x, chunk_y) in candidates {
@@ -40,7 +54,104 @@ pub fn next_generation(current: &World) -> (World, GenerationDelta) {
     }
 
     let delta = generation_delta(current, &next);
-    (next, delta)
+    (
+        next,
+        delta,
+        GenerationStats {
+            candidate_chunks: candidate_count,
+            elapsed: started.elapsed(),
+        },
+    )
+}
+
+/// Computes a generation by counting the eight neighbors for 64 cells at once.
+pub fn next_generation_bit_parallel(current: &World) -> (World, GenerationDelta, GenerationStats) {
+    let started = Instant::now();
+    let candidates = candidate_chunks(current);
+    let candidate_count = candidates.len();
+    let mut next = World::new();
+
+    for (chunk_x, chunk_y) in candidates {
+        let around: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                let dx = column as i64 - 1;
+                let dy = row as i64 - 1;
+                let (Some(x), Some(y)) = (chunk_x.checked_add(dx), chunk_y.checked_add(dy)) else {
+                    return None;
+                };
+                current.chunk((x, y))
+            })
+        });
+        let mut next_chunk = Chunk::default();
+
+        for y in 0..CHUNK_SIDE {
+            let (above_west, above, above_east) =
+                neighbor_rows(&around, if y == 0 { 0 } else { 1 }, y.wrapping_sub(1) % 64);
+            let (middle_west, alive, middle_east) = neighbor_rows(&around, 1, y);
+            let (below_west, below, below_east) = neighbor_rows(
+                &around,
+                if y == CHUNK_SIDE - 1 { 2 } else { 1 },
+                (y + 1) % 64,
+            );
+
+            let neighbors = [
+                shift_west(above, above_west),
+                above,
+                shift_east(above, above_east),
+                shift_west(alive, middle_west),
+                shift_east(alive, middle_east),
+                shift_west(below, below_west),
+                below,
+                shift_east(below, below_east),
+            ];
+            let mut ones = 0_u64;
+            let mut twos = 0_u64;
+            let mut fours = 0_u64;
+            let mut eights = 0_u64;
+            for mask in neighbors {
+                let carry_one = ones & mask;
+                ones ^= mask;
+                let carry_two = twos & carry_one;
+                twos ^= carry_one;
+                let carry_four = fours & carry_two;
+                fours ^= carry_two;
+                eights ^= carry_four;
+            }
+
+            let exactly_two = !ones & twos & !fours & !eights;
+            let exactly_three = ones & twos & !fours & !eights;
+            next_chunk.set_row_bits(y, exactly_three | (alive & exactly_two));
+        }
+
+        next.insert_chunk((chunk_x, chunk_y), next_chunk);
+    }
+
+    let delta = generation_delta(current, &next);
+    (
+        next,
+        delta,
+        GenerationStats {
+            candidate_chunks: candidate_count,
+            elapsed: started.elapsed(),
+        },
+    )
+}
+
+fn neighbor_rows(around: &[[Option<&Chunk>; 3]; 3], row: usize, y: usize) -> (u64, u64, u64) {
+    let get = |column: usize| {
+        around[row][column]
+            .map(|chunk| chunk.rows()[y])
+            .unwrap_or_default()
+    };
+    (get(0), get(1), get(2))
+}
+
+fn shift_west(row: u64, west_chunk_row: u64) -> u64 {
+    (row << 1) | (west_chunk_row >> 63)
+}
+
+fn shift_east(row: u64, east_chunk_row: u64) -> u64 {
+    (row >> 1) | ((east_chunk_row & 1) << 63)
 }
 
 fn candidate_chunks(world: &World) -> HashSet<ChunkCoord> {

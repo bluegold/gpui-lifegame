@@ -1,7 +1,20 @@
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
 use gpui::{
     Context, IntoElement, ParentElement, Render, Styled, Window, canvas, div, fill, point, px, rgb,
     size,
 };
+
+static PAINTED_ITEMS: AtomicUsize = AtomicUsize::new(0);
+static PAINT_TIME_NANOS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_paint_metrics() -> (usize, Duration) {
+    (
+        PAINTED_ITEMS.swap(0, Ordering::Relaxed),
+        Duration::from_nanos(PAINT_TIME_NANOS.swap(0, Ordering::Relaxed)),
+    )
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PaintItem {
@@ -34,6 +47,8 @@ impl Render for TileView {
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, _| {
+                    let started = Instant::now();
+                    let item_count = items.len();
                     for item in items {
                         let density = item.density.clamp(0.0, 1.0);
                         let red = (17.0 + 55.0 * density) as u32;
@@ -50,6 +65,11 @@ impl Render for TileView {
                             rgb((red << 16) | (green << 8) | blue),
                         ));
                     }
+                    PAINTED_ITEMS.fetch_add(item_count, Ordering::Relaxed);
+                    PAINT_TIME_NANOS.fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
                 },
             )
             .size_full(),

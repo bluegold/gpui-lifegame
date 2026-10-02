@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::mem::size_of;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
@@ -24,6 +25,18 @@ struct AppView {
     timer_task: Option<Task<()>>,
     speed: u16,
     generation: u64,
+    generation_stats: crate::simulation::GenerationStats,
+    render_stats: RenderStats,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RenderStats {
+    visible_chunks: usize,
+    tile_views: usize,
+    updated_tiles: usize,
+    paint_items: usize,
+    prepare_time: Duration,
+    delayed_generations: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +53,7 @@ enum PointerMode {
 const MIN_CELL_SIZE: f64 = 0.0625;
 const MAX_CELL_SIZE: f64 = 128.0;
 const PIXELS_PER_SCROLL_LINE: f64 = 40.0;
-const TOOLBAR_HEIGHT: f64 = 48.0;
+const TOOLBAR_HEIGHT: f64 = 92.0;
 
 impl AppView {
     fn new() -> Self {
@@ -58,6 +71,8 @@ impl AppView {
             timer_task: None,
             speed: 10,
             generation: 0,
+            generation_stats: crate::simulation::GenerationStats::default(),
+            render_stats: RenderStats::default(),
         }
     }
 
@@ -109,7 +124,14 @@ impl AppView {
     }
 
     fn step(&mut self, cx: &mut Context<Self>) {
-        self.world = crate::simulation::next_generation(&self.world).0;
+        let (world, _, stats) = crate::simulation::next_generation_bit_parallel(&self.world);
+        self.world = world;
+        self.generation_stats = stats;
+        let period = generation_period(self.speed);
+        if self.generation_stats.elapsed > period {
+            self.render_stats.delayed_generations =
+                self.render_stats.delayed_generations.saturating_add(1);
+        }
         self.generation = self.generation.saturating_add(1);
         cx.notify();
     }
@@ -254,9 +276,11 @@ impl AppView {
     }
 
     fn prepare_tiles(&mut self, plan: &RenderPlan, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let started = Instant::now();
         let desired: HashSet<_> = plan.tiles.iter().copied().collect();
         let mut tile_contents = HashMap::new();
         let grouped = plan.chunks_per_tile > 1;
+        let mut visible_chunks = 0;
 
         for (chunk_coord, chunk) in self.world.chunks() {
             let tile_coord = RenderTileCoord {
@@ -266,6 +290,7 @@ impl AppView {
             if !desired.contains(&tile_coord) {
                 continue;
             }
+            visible_chunks += 1;
             if grouped {
                 let content = tile_contents
                     .entry(tile_coord)
@@ -282,6 +307,8 @@ impl AppView {
         let cell_size = self.camera.cell_size();
         let group_cell_span = plan.chunks_per_tile as f64 * crate::CHUNK_SIDE as f64 * cell_size;
         let mut active = Vec::with_capacity(plan.tiles.len());
+        let mut updated_tiles = 0;
+        let mut paint_items = 0;
 
         for tile_coord in &plan.tiles {
             let chunk_origin_x = i128::from(tile_coord.x)
@@ -319,8 +346,10 @@ impl AppView {
                 .entry(*tile_coord)
                 .or_insert_with(|| cx.new(|_| TileView::default()))
                 .clone();
+            paint_items += content.items.len();
             let changed = tile.update(cx, |view, _| view.replace(content.items));
             if changed {
+                updated_tiles += 1;
                 tile.update(cx, |_, tile_cx| tile_cx.notify());
             }
             active.push(
@@ -338,6 +367,14 @@ impl AppView {
         }
 
         self.tile_views.retain(|coord, _| desired.contains(coord));
+        self.render_stats = RenderStats {
+            visible_chunks,
+            tile_views: self.tile_views.len(),
+            updated_tiles,
+            paint_items,
+            prepare_time: started.elapsed(),
+            delayed_generations: self.render_stats.delayed_generations,
+        };
         active
     }
 }
@@ -350,6 +387,10 @@ impl Render for AppView {
         let tiles = plan_visible_tiles(self.camera, width, height, DEFAULT_OVERSCAN_CHUNKS)
             .map(|plan| self.prepare_tiles(&plan, cx))
             .unwrap_or_default();
+        let stats = self.render_stats;
+        let (painted_items, paint_time) = crate::tile_view::take_paint_metrics();
+        let estimated_bytes =
+            self.world.chunk_count() * (size_of::<Chunk>() + size_of::<crate::ChunkCoord>() + 32);
 
         div()
             .size_full()
@@ -361,51 +402,98 @@ impl Render for AppView {
                     .h(px(TOOLBAR_HEIGHT as f32))
                     .w_full()
                     .flex()
+                    .flex_col()
                     .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
                     .bg(rgb(0x1f2937))
-                    .child(control_button(
-                        "run-toggle",
-                        if self.running { "Pause" } else { "Start" },
-                        cx.listener(|this, _, _, cx| this.toggle_running(cx)),
-                    ))
-                    .child(control_button(
-                        "step",
-                        "Step",
-                        cx.listener(|this, _, _, cx| this.step(cx)),
-                    ))
-                    .child(control_button(
-                        "clear",
-                        "Clear",
-                        cx.listener(|this, _, _, cx| this.clear(cx)),
-                    ))
-                    .child(control_button(
-                        "randomize",
-                        "Randomize",
-                        cx.listener(|this, _, window, cx| this.randomize(window, cx)),
-                    ))
                     .child(
                         div()
-                            .text_color(gpui::white())
-                            .child(format!("世代 {}", self.generation)),
+                            .h(px(48.0))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .child(control_button(
+                                "run-toggle",
+                                if self.running { "Pause" } else { "Start" },
+                                cx.listener(|this, _, _, cx| this.toggle_running(cx)),
+                            ))
+                            .child(control_button(
+                                "step",
+                                "Step",
+                                cx.listener(|this, _, _, cx| this.step(cx)),
+                            ))
+                            .child(control_button(
+                                "clear",
+                                "Clear",
+                                cx.listener(|this, _, _, cx| this.clear(cx)),
+                            ))
+                            .child(control_button(
+                                "randomize",
+                                "Randomize",
+                                cx.listener(|this, _, window, cx| this.randomize(window, cx)),
+                            ))
+                            .child(
+                                div()
+                                    .text_color(gpui::white())
+                                    .child(format!("世代 {}", self.generation)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(gpui::white())
+                                    .child(format!("{} 世代/秒", self.speed)),
+                            )
+                            .child(control_button(
+                                "speed-down",
+                                "−",
+                                cx.listener(|this, _, _, cx| this.change_speed(false, cx)),
+                            ))
+                            .child(control_button(
+                                "speed-up",
+                                "+",
+                                cx.listener(|this, _, _, cx| this.change_speed(true, cx)),
+                            )),
                     )
                     .child(
                         div()
+                            .h(px(44.0))
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .px_3()
                             .text_color(gpui::white())
-                            .child(format!("{} 世代/秒", self.speed)),
-                    )
-                    .child(control_button(
-                        "speed-down",
-                        "−",
-                        cx.listener(|this, _, _, cx| this.change_speed(false, cx)),
-                    ))
-                    .child(control_button(
-                        "speed-up",
-                        "+",
-                        cx.listener(|this, _, _, cx| this.change_speed(true, cx)),
-                    )),
+                            .child(
+                                div()
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(format!(
+                                        "sim {:.2} ms / 候補 {} | 表示 {} | View {} | 更新 {} | items {}",
+                                        self.generation_stats.elapsed.as_secs_f64() * 1000.0,
+                                        self.generation_stats.candidate_chunks,
+                                        stats.visible_chunks,
+                                        stats.tile_views,
+                                        stats.updated_tiles,
+                                        stats.paint_items,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(format!(
+                                        "paint {}・{:.1} ms | 準備 {:.2} ms | 超過 {} | chunk {} / 約 {:.1} KiB",
+                                        painted_items,
+                                        paint_time.as_secs_f64() * 1000.0,
+                                        stats.prepare_time.as_secs_f64() * 1000.0,
+                                        stats.delayed_generations,
+                                        self.world.chunk_count(),
+                                        estimated_bytes as f64 / 1024.0,
+                                    )),
+                            ),
+                    ),
             )
             .child(
                 div()

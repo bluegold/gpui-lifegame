@@ -45,6 +45,10 @@ impl Chunk {
     pub(crate) fn rows(&self) -> &[u64; CHUNK_SIDE] {
         &self.rows
     }
+
+    pub(crate) fn set_row_bits(&mut self, y: usize, row: u64) {
+        self.rows[y] = row;
+    }
 }
 
 fn local_indices(x: u8, y: u8) -> (u32, usize) {
