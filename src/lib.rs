@@ -4,6 +4,8 @@ pub mod camera;
 pub mod chunk;
 pub mod coords;
 pub mod simulation;
+#[cfg(feature = "desktop")]
+pub mod tile_view;
 pub mod viewport;
 pub mod world;
 

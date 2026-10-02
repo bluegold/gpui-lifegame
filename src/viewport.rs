@@ -13,7 +13,7 @@ pub struct ChunkBounds {
     pub max_y: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RenderTileCoord {
     pub x: i64,
     pub y: i64,

@@ -266,9 +266,9 @@ struct TileView {
 }
 ```
 
-TileView はセルごとの子要素を作らず、カスタム Element の paint 処理で生存セルを直接描きます。
+TileView はセルごとの子要素を作らず、GPUI Canvas の paint callback で生存セルを直接描きます。
 
-GPUI は公式 crates.io の最新安定版を使います。2026-10-02 時点では `gpui = "=0.2.2"` とし、Cargo.lock をコミットして依存解決を固定します。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、変更された Entity だけを notify します。カスタム Element 単体を差分管理の境界とはみなしません。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。実装時には現行 API で変更されていない TileView の描画処理が再利用されることを確認します。
+GPUI は公式 crates.io の最新安定版を使います。2026-10-02 時点では `gpui = "=0.2.2"` とし、Cargo.lock をコミットして依存解決を固定します。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、表示範囲と overscan に含まれるタイルだけを保持します。パンで位置だけが変わった場合はルート View が配置を更新し、セル内容が変わった TileView だけを notify します。TileView は子要素としてセルを作らず、Canvas の paint callback で生存セル、4 x 4 ブロック、またはチャンク密度を描きます。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。
 
 ```text
 TileView
