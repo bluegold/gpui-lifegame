@@ -19,7 +19,7 @@ World、Simulation、Viewport、Renderingの責務を分けます。
 World はチャンク単位の疎なマップで表します。
 
 ```rust
-pub type ChunkCoord = (i32, i32);
+pub type ChunkCoord = (i64, i64);
 
 pub struct World {
     chunks: HashMap<ChunkCoord, Chunk>,
@@ -44,7 +44,7 @@ pub struct Chunk {
 
 ### 3.3 座標
 
-World 上のセル座標には符号付き整数を使います。
+World 上のセル座標とチャンク座標には符号付き 64 ビット整数を使います。World は疎なデータ構造ですが、座標の表現範囲は `i64` の範囲に限られます。
 
 ```rust
 pub struct CellCoord {
@@ -53,7 +53,7 @@ pub struct CellCoord {
 }
 ```
 
-チャンク座標も符号付き整数で表します。
+セル座標をチャンク座標へ変換するときは `div_euclid(64)` を使います。したがって有効なチャンク座標は各軸で `i64::MIN.div_euclid(64)` から `i64::MAX.div_euclid(64)` までです。チャンクの隣接座標を計算するときは checked arithmetic を使い、この範囲を越える候補を作りません。セルの近傍座標も checked arithmetic で計算し、`i64` の範囲外は盤面外として扱います。
 
 負の座標を正しいチャンクへ割り当てるため、Rust の `/` と `%` ではなく `div_euclid` と `rem_euclid` を使います。通常の除算は 0 方向へ丸めますが、この処理では床関数に相当する除算が必要です。
 
@@ -268,7 +268,7 @@ struct TileView {
 
 TileView はセルごとの子要素を作らず、カスタム Element の paint 処理で生存セルを直接描きます。
 
-GPUI は現行の上流 API を前提にします。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、変更された Entity だけを notify します。カスタム Element 単体を差分管理の境界とはみなしません。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。実装時には現行 API で変更されていない TileView の描画処理が再利用されることを確認します。
+GPUI は公式 crates.io の最新安定版を使います。2026-10-02 時点では `gpui = "=0.2.2"` とし、Cargo.lock をコミットして依存解決を固定します。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、変更された Entity だけを notify します。カスタム Element 単体を差分管理の境界とはみなしません。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。実装時には現行 API で変更されていない TileView の描画処理が再利用されることを確認します。
 
 ```text
 TileView
@@ -343,7 +343,7 @@ visible chunks + 1 chunk margin
 
 ### 8.3 表示タイル数の上限
 
-画面に表示する TileView の総数には `MAX_RENDER_TILES` を設定し、overscan 分もこの上限に含めます。表示範囲に収まるチャンク数が上限を超える場合は、複数チャンクをまとめた表示タイルへ切り替えます。ズームアウトに応じて集約範囲を広げ、表示タイル数が上限以下になるまでまとめます。
+画面に表示する TileView の総数には `MAX_RENDER_TILES = 4096` を設定し、overscan 分もこの上限に含めます。表示範囲に収まるチャンク数が上限を超える場合は、複数チャンクをまとめた表示タイルへ切り替えます。集約タイルは原点に揃えた 2 の累乗個のチャンクを単位とし、表示範囲と overscan を覆うタイル数が上限以下になる最小の集約幅を選びます。
 
 この上限は描画単位だけに適用します。World の座標や保存済みチャンクを切り詰めず、集約表示中もセル編集とパンには元の座標を使います。
 
@@ -422,7 +422,7 @@ cell_size >= 2px
 cell_size < 0.5px
 ```
 
-チャンク内の生存数を使い、タイルまたは小ブロック単位で描画します。`MAX_RENDER_TILES` を超える場合は、複数チャンクの密度をまとめた表示タイルを使います。
+チャンク内の生存数を使い、タイルまたは小ブロック単位で描画します。`MAX_RENDER_TILES` を超える場合は、複数チャンクの密度をまとめた表示タイルを使います。集約タイルの密度は、範囲内の生存セル数を対象セル数（集約チャンク数 x 4096）で割った割合とします。座標範囲外のセルは死んだセルとして数えます。
 
 このとき個別セル座標の paint は行いません。
 
@@ -479,20 +479,20 @@ cell coordinate
 
 セル編集とパンのドラッグ操作は、別の入力として扱います。
 
-操作の割り当て例です。
+初期版では、操作を次のように割り当てます。シミュレーション速度は 1〜120 世代/秒の範囲で設定します。
 
 ```text
-left drag:
+left click / drag:
     draw
 
 middle drag:
     pan
 
 wheel:
-    zoom
+    zoom around cursor
 ```
 
-または modifier key を利用します。
+Start / Pause、Step、Clear、Randomize は画面上の操作部品から実行します。
 
 ## 13. スレッド構成
 
