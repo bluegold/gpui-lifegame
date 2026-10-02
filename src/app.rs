@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, App, AppContext, Application, Bounds, Context, Entity, IntoElement, ParentElement,
-    Render, Styled, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
+    ScrollDelta, ScrollWheelEvent, Styled, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 
 use crate::CellCoord;
@@ -16,7 +17,23 @@ struct AppView {
     world: World,
     camera: Camera,
     tile_views: HashMap<RenderTileCoord, Entity<TileView>>,
+    pointer_mode: Option<PointerMode>,
 }
+
+#[derive(Clone, Copy)]
+enum PointerMode {
+    Painting {
+        alive: bool,
+        last_cell: CellCoord,
+    },
+    Panning {
+        last_position: gpui::Point<gpui::Pixels>,
+    },
+}
+
+const MIN_CELL_SIZE: f64 = 0.0625;
+const MAX_CELL_SIZE: f64 = 128.0;
+const PIXELS_PER_SCROLL_LINE: f64 = 40.0;
 
 impl AppView {
     fn new() -> Self {
@@ -29,7 +46,97 @@ impl AppView {
             camera: Camera::new(CellCoord { x: -40, y: -30 }, 8.0)
                 .expect("initial camera scale is valid"),
             tile_views: HashMap::new(),
+            pointer_mode: None,
         }
+    }
+
+    fn begin_paint(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(cell) = self.screen_to_cell(event.position) else {
+            return;
+        };
+        let alive = !self.world.get(cell);
+        self.pointer_mode = Some(PointerMode::Painting {
+            alive,
+            last_cell: cell,
+        });
+        if self.world.set(cell, alive) {
+            cx.notify();
+        }
+    }
+
+    fn begin_pan(&mut self, event: &MouseDownEvent) {
+        self.pointer_mode = Some(PointerMode::Panning {
+            last_position: event.position,
+        });
+    }
+
+    fn pointer_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        match self.pointer_mode {
+            Some(PointerMode::Painting { alive, last_cell })
+                if event.pressed_button == Some(MouseButton::Left) =>
+            {
+                let Some(cell) = self.screen_to_cell(event.position) else {
+                    return;
+                };
+                let changed = paint_line(&mut self.world, last_cell, cell, alive);
+                self.pointer_mode = Some(PointerMode::Painting {
+                    alive,
+                    last_cell: cell,
+                });
+                if changed {
+                    cx.notify();
+                }
+            }
+            Some(PointerMode::Panning { last_position })
+                if event.pressed_button == Some(MouseButton::Middle) =>
+            {
+                let delta_x = f64::from(event.position.x - last_position.x);
+                let delta_y = f64::from(event.position.y - last_position.y);
+                self.pointer_mode = Some(PointerMode::Panning {
+                    last_position: event.position,
+                });
+                if self.camera.pan_by_pixels(delta_x, delta_y) {
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end_pointer(&mut self, button: MouseButton) {
+        let should_end = matches!(
+            (self.pointer_mode, button),
+            (Some(PointerMode::Painting { .. }), MouseButton::Left)
+                | (Some(PointerMode::Panning { .. }), MouseButton::Middle)
+        );
+        if should_end {
+            self.pointer_mode = None;
+        }
+    }
+
+    fn zoom(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let scroll_lines = match event.delta {
+            ScrollDelta::Lines(delta) => f64::from(delta.y),
+            ScrollDelta::Pixels(delta) => f64::from(delta.y) / PIXELS_PER_SCROLL_LINE,
+        };
+        if !scroll_lines.is_finite() || scroll_lines == 0.0 {
+            return;
+        }
+        let new_cell_size = zoomed_cell_size(self.camera.cell_size(), scroll_lines);
+        if new_cell_size != self.camera.cell_size()
+            && self.camera.zoom_about(
+                f64::from(event.position.x),
+                f64::from(event.position.y),
+                new_cell_size,
+            )
+        {
+            cx.notify();
+        }
+    }
+
+    fn screen_to_cell(&self, position: gpui::Point<gpui::Pixels>) -> Option<CellCoord> {
+        self.camera
+            .screen_to_cell(f64::from(position.x), f64::from(position.y))
     }
 
     fn prepare_tiles(&mut self, plan: &RenderPlan, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -123,9 +230,9 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bounds = window.bounds();
-        let width = f64::from(bounds.size.width);
-        let height = f64::from(bounds.size.height);
+        let viewport_size = window.viewport_size();
+        let width = f64::from(viewport_size.width);
+        let height = f64::from(viewport_size.height);
         let tiles = plan_visible_tiles(self.camera, width, height, DEFAULT_OVERSCAN_CHUNKS)
             .map(|plan| self.prepare_tiles(&plan, cx))
             .unwrap_or_default();
@@ -135,6 +242,36 @@ impl Render for AppView {
             .relative()
             .overflow_hidden()
             .bg(rgb(0x111827))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| this.begin_paint(event, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _, _| this.begin_pan(event)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Left)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Left)),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Middle)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.end_pointer(MouseButton::Middle)),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.pointer_move(event, cx)),
+            )
+            .on_scroll_wheel(
+                cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.zoom(event, cx)),
+            )
             .children(tiles)
     }
 }
@@ -212,6 +349,46 @@ impl TileContent {
     }
 }
 
+fn paint_line(world: &mut World, start: CellCoord, end: CellCoord, alive: bool) -> bool {
+    let mut x = i128::from(start.x);
+    let mut y = i128::from(start.y);
+    let end_x = i128::from(end.x);
+    let end_y = i128::from(end.y);
+    let delta_x = (end_x - x).abs();
+    let step_x = if x < end_x { 1 } else { -1 };
+    let delta_y = -(end_y - y).abs();
+    let step_y = if y < end_y { 1 } else { -1 };
+    let mut error = delta_x + delta_y;
+    let mut changed = false;
+
+    loop {
+        changed |= world.set(
+            CellCoord {
+                x: x as i64,
+                y: y as i64,
+            },
+            alive,
+        );
+        if x == end_x && y == end_y {
+            break;
+        }
+        let twice_error = 2 * error;
+        if twice_error >= delta_y {
+            error += delta_y;
+            x += step_x;
+        }
+        if twice_error <= delta_x {
+            error += delta_x;
+            y += step_y;
+        }
+    }
+    changed
+}
+
+fn zoomed_cell_size(current: f64, scroll_lines: f64) -> f64 {
+    (current * 1.1_f64.powf(-scroll_lines.clamp(-100.0, 100.0))).clamp(MIN_CELL_SIZE, MAX_CELL_SIZE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +433,26 @@ mod tests {
         assert_eq!(content.items.len(), 1);
         assert_eq!(content.items[0].width, 4.0);
         assert_eq!(content.items[0].density, 2.0 / 4096.0);
+    }
+
+    #[test]
+    fn drag_paint_fills_each_cell_between_pointer_events() {
+        let mut world = World::new();
+        let start = CellCoord { x: -3, y: -2 };
+        let end = CellCoord { x: 2, y: 1 };
+
+        assert!(paint_line(&mut world, start, end, true));
+        assert!(world.get(start));
+        assert!(world.get(end));
+        assert!(world.get(CellCoord { x: -1, y: -1 }));
+        assert!(!paint_line(&mut world, start, end, true));
+    }
+
+    #[test]
+    fn wheel_zoom_is_bounded_and_has_the_expected_direction() {
+        assert!(zoomed_cell_size(8.0, 1.0) < 8.0);
+        assert!(zoomed_cell_size(8.0, -1.0) > 8.0);
+        assert_eq!(zoomed_cell_size(8.0, 100.0), MIN_CELL_SIZE);
+        assert_eq!(zoomed_cell_size(8.0, -100.0), MAX_CELL_SIZE);
     }
 }
