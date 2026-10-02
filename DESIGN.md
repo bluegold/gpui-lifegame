@@ -268,6 +268,8 @@ struct TileView {
 
 TileView はセルごとの子要素を作らず、カスタム Element の paint 処理で生存セルを直接描きます。
 
+GPUI は現行の上流 API を前提にします。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、変更された Entity だけを notify します。カスタム Element 単体を差分管理の境界とはみなしません。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。実装時には現行 API で変更されていない TileView の描画処理が再利用されることを確認します。
+
 ```text
 TileView
    ↓
@@ -339,7 +341,13 @@ visible chunks + 1 chunk margin
 
 これにより、パン中に View を生成したり破棄したりする回数を減らせます。
 
-### 8.3 TileView のライフサイクル
+### 8.3 表示タイル数の上限
+
+画面に表示する TileView の総数には `MAX_RENDER_TILES` を設定し、overscan 分もこの上限に含めます。表示範囲に収まるチャンク数が上限を超える場合は、複数チャンクをまとめた表示タイルへ切り替えます。ズームアウトに応じて集約範囲を広げ、表示タイル数が上限以下になるまでまとめます。
+
+この上限は描画単位だけに適用します。World の座標や保存済みチャンクを切り詰めず、集約表示中もセル編集とパンには元の座標を使います。
+
+### 8.4 TileView のライフサイクル
 
 TileView は以下の集合だけ保持します。
 
@@ -414,7 +422,7 @@ cell_size >= 2px
 cell_size < 0.5px
 ```
 
-チャンク内の生存数を使い、タイルまたは小ブロック単位で描画します。
+チャンク内の生存数を使い、タイルまたは小ブロック単位で描画します。`MAX_RENDER_TILES` を超える場合は、複数チャンクの密度をまとめた表示タイルを使います。
 
 このとき個別セル座標の paint は行いません。
 
@@ -513,7 +521,7 @@ World 全体を世代ごとに複製しない設計にします。
 - double-buffered World ownership
 - Arc ベース snapshot
 
-どれを採用するかは実測後に決定します。
+転送方式は実測後に決定します。ワーカーへ分離する場合も、世代ごとの描画要求をキューに積まず、UI は次のフレームで最新の一貫した状態を読みます。保留中の通知はまとめ、UI は表示中のタイルを前回の描画状態と比較して必要なものだけ更新します。World 全体を世代ごとに複製せず、この最新状態を安全に公開する方法はワーカー分離時に選びます。
 
 ## 14. 並行処理の境界
 
@@ -601,6 +609,8 @@ if next_chunk.is_empty() {
 ### 性能
 
 World の外接矩形が広がっても空領域にメモリを割り当てません。ビューポート外に TileView を作らず、変化していない TileView も更新しません。シミュレーションでは生存セルの周辺だけを走査し、ズームアウト時の描画量を制御します。
+
+表示範囲とoverscanを含む TileView の数は、ズーム倍率にかかわらず `MAX_RENDER_TILES` 以下に保ちます。集約表示中もセル座標を切り詰めず、個別セルの編集位置を正しく求めます。
 
 ## 20. テスト方針
 
