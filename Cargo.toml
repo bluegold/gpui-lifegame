@@ -1,0 +1,16 @@
+[package]
+name = "gpui-lifegame"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+desktop = ["dep:gpui"]
+
+[[bin]]
+name = "gpui-lifegame"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[dependencies]
+gpui = { version = "=0.2.2", optional = true }
