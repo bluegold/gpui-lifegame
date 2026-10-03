@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
@@ -12,6 +13,7 @@ use gpui::{
 use crate::CellCoord;
 use crate::camera::Camera;
 use crate::chunk::Chunk;
+use crate::coords::split_cell_coord;
 use crate::tile_view::{PaintItem, TileView};
 use crate::viewport::{DEFAULT_OVERSCAN_CHUNKS, RenderPlan, RenderTileCoord, plan_visible_tiles};
 use crate::world::World;
@@ -20,6 +22,9 @@ struct AppView {
     world: World,
     camera: Camera,
     tile_views: HashMap<RenderTileCoord, Entity<TileView>>,
+    tile_content_keys: HashMap<RenderTileCoord, TileContentKey>,
+    dirty_chunks: HashSet<crate::ChunkCoord>,
+    invalidate_all_tiles: bool,
     pointer_mode: Option<PointerMode>,
     running: bool,
     timer_task: Option<Task<()>>,
@@ -27,6 +32,10 @@ struct AppView {
     generation: u64,
     generation_stats: crate::simulation::GenerationStats,
     render_stats: RenderStats,
+    frame_times: VecDeque<Instant>,
+    frame_rate: f64,
+    metrics_started_at: Instant,
+    metric_samples: VecDeque<MetricSample>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -38,6 +47,36 @@ struct RenderStats {
     prepare_time: Duration,
     delayed_generations: u64,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+struct TileContentKey {
+    cell_size: f64,
+    chunks_per_tile: i64,
+}
+
+#[derive(Clone, Copy)]
+struct MetricSample {
+    elapsed_ms: f64,
+    frame_rate: f64,
+    generation: u64,
+    origin_x: i64,
+    origin_y: i64,
+    cell_size: f64,
+    sim_ms: f64,
+    candidate_chunks: usize,
+    visible_chunks: usize,
+    tile_views: usize,
+    updated_tiles: usize,
+    paint_items: usize,
+    painted_items: usize,
+    paint_ms: f64,
+    prepare_ms: f64,
+    delayed_generations: u64,
+    world_chunks: usize,
+    estimated_bytes: usize,
+}
+
+const MAX_METRIC_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Copy)]
 enum PointerMode {
@@ -66,6 +105,9 @@ impl AppView {
             camera: Camera::new(CellCoord { x: -40, y: -30 }, 8.0)
                 .expect("initial camera scale is valid"),
             tile_views: HashMap::new(),
+            tile_content_keys: HashMap::new(),
+            dirty_chunks: HashSet::new(),
+            invalidate_all_tiles: true,
             pointer_mode: None,
             running: false,
             timer_task: None,
@@ -73,6 +115,10 @@ impl AppView {
             generation: 0,
             generation_stats: crate::simulation::GenerationStats::default(),
             render_stats: RenderStats::default(),
+            frame_times: VecDeque::with_capacity(64),
+            frame_rate: 0.0,
+            metrics_started_at: Instant::now(),
+            metric_samples: VecDeque::with_capacity(MAX_METRIC_SAMPLES),
         }
     }
 
@@ -124,8 +170,9 @@ impl AppView {
     }
 
     fn step(&mut self, cx: &mut Context<Self>) {
-        let (world, _, stats) = crate::simulation::next_generation_bit_parallel(&self.world);
+        let (world, delta, stats) = crate::simulation::next_generation_bit_parallel(&self.world);
         self.world = world;
+        self.dirty_chunks.extend(delta.changed_chunks);
         self.generation_stats = stats;
         let period = generation_period(self.speed);
         if self.generation_stats.elapsed > period {
@@ -139,6 +186,8 @@ impl AppView {
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.pause_without_notify();
         self.world = World::new();
+        self.dirty_chunks.clear();
+        self.invalidate_all_tiles = true;
         self.generation = 0;
         cx.notify();
     }
@@ -156,6 +205,8 @@ impl AppView {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             self.world = randomized_world(center, seed);
+            self.dirty_chunks.clear();
+            self.invalidate_all_tiles = true;
             self.generation = 0;
         }
         cx.notify();
@@ -184,6 +235,55 @@ impl AppView {
         }
     }
 
+    fn export_metrics(&self, cx: &mut Context<Self>) {
+        let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some("lifegame-performance.csv"));
+        let samples = self.metric_samples.iter().copied().collect::<Vec<_>>();
+        cx.spawn(async move |_this, _cx| match receiver.await {
+            Ok(Ok(Some(mut path))) => {
+                if path.extension().is_none() {
+                    path.set_extension("csv");
+                }
+                match write_metrics_csv(&path, &samples) {
+                    Ok(()) => eprintln!(
+                        "計測CSVを保存しました: {} ({}件)",
+                        path.display(),
+                        samples.len()
+                    ),
+                    Err(error) => eprintln!("計測CSVの保存に失敗しました: {error}"),
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => eprintln!("保存先ダイアログを開けませんでした: {error}"),
+            Err(error) => eprintln!("保存先ダイアログが終了しました: {error}"),
+        })
+        .detach();
+    }
+
+    fn record_frame_completion(&mut self) {
+        let now = Instant::now();
+        self.frame_times.push_back(now);
+        while self.frame_times.len() > 2
+            && now.duration_since(self.frame_times[0]) > Duration::from_secs(1)
+        {
+            self.frame_times.pop_front();
+        }
+        while self.frame_times.len() > 64 {
+            self.frame_times.pop_front();
+        }
+        self.frame_rate = match (self.frame_times.front(), self.frame_times.back()) {
+            (Some(first), Some(last)) if self.frame_times.len() > 1 => {
+                let elapsed = last.duration_since(*first).as_secs_f64();
+                if elapsed > 0.0 {
+                    (self.frame_times.len() - 1) as f64 / elapsed
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+    }
+
     fn begin_paint(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
         let Some(cell) = self.screen_to_cell(event.position) else {
             return;
@@ -194,6 +294,7 @@ impl AppView {
             last_cell: cell,
         });
         if self.world.set(cell, alive) {
+            self.dirty_chunks.insert(split_cell_coord(cell).0);
             cx.notify();
         }
     }
@@ -218,6 +319,8 @@ impl AppView {
                     last_cell: cell,
                 });
                 if changed {
+                    self.dirty_chunks.clear();
+                    self.invalidate_all_tiles = true;
                     cx.notify();
                 }
             }
@@ -278,7 +381,28 @@ impl AppView {
     fn prepare_tiles(&mut self, plan: &RenderPlan, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let started = Instant::now();
         let desired: HashSet<_> = plan.tiles.iter().copied().collect();
-        let mut tile_contents = HashMap::new();
+        let cell_size = self.camera.cell_size();
+        let content_key = TileContentKey {
+            cell_size,
+            chunks_per_tile: plan.chunks_per_tile,
+        };
+        let mut dirty_tiles: HashSet<_> = plan
+            .tiles
+            .iter()
+            .copied()
+            .filter(|coord| {
+                self.invalidate_all_tiles || self.tile_content_keys.get(coord) != Some(&content_key)
+            })
+            .collect();
+        dirty_tiles.extend(self.dirty_chunks.iter().filter_map(|&(chunk_x, chunk_y)| {
+            let tile_coord = RenderTileCoord {
+                x: chunk_x.div_euclid(plan.chunks_per_tile),
+                y: chunk_y.div_euclid(plan.chunks_per_tile),
+            };
+            desired.contains(&tile_coord).then_some(tile_coord)
+        }));
+
+        let mut tile_contents: HashMap<RenderTileCoord, TileContent> = HashMap::new();
         let grouped = plan.chunks_per_tile > 1;
         let mut visible_chunks = 0;
 
@@ -291,20 +415,19 @@ impl AppView {
                 continue;
             }
             visible_chunks += 1;
+            if !dirty_tiles.contains(&tile_coord) {
+                continue;
+            }
             if grouped {
                 let content = tile_contents
                     .entry(tile_coord)
                     .or_insert_with(TileContent::default);
                 content.population += f64::from(chunk.population());
             } else {
-                tile_contents.insert(
-                    tile_coord,
-                    TileContent::from_chunk(chunk, self.camera.cell_size()),
-                );
+                tile_contents.insert(tile_coord, TileContent::from_chunk(chunk, cell_size));
             }
         }
 
-        let cell_size = self.camera.cell_size();
         let group_cell_span = plan.chunks_per_tile as f64 * crate::CHUNK_SIDE as f64 * cell_size;
         let mut active = Vec::with_capacity(plan.tiles.len());
         let mut updated_tiles = 0;
@@ -329,29 +452,31 @@ impl AppView {
                 64.0 * cell_size
             };
             let tile_height = tile_width;
-            let mut content = tile_contents.remove(tile_coord).unwrap_or_default();
-            if grouped {
-                let chunk_area = plan.chunks_per_tile as f64 * plan.chunks_per_tile as f64;
-                content.items = vec![PaintItem {
-                    x: 0.0,
-                    y: 0.0,
-                    width: tile_width as f32,
-                    height: tile_height as f32,
-                    density: content.population / (chunk_area * 4096.0),
-                }];
-            }
-
             let tile = self
                 .tile_views
                 .entry(*tile_coord)
                 .or_insert_with(|| cx.new(|_| TileView::default()))
                 .clone();
-            paint_items += content.items.len();
-            let changed = tile.update(cx, |view, _| view.replace(content.items));
-            if changed {
-                updated_tiles += 1;
-                tile.update(cx, |_, tile_cx| tile_cx.notify());
+            if dirty_tiles.contains(tile_coord) {
+                let mut content = tile_contents.remove(tile_coord).unwrap_or_default();
+                if grouped {
+                    let chunk_area = plan.chunks_per_tile as f64 * plan.chunks_per_tile as f64;
+                    content.items = vec![PaintItem {
+                        x: 0.0,
+                        y: 0.0,
+                        width: tile_width as f32,
+                        height: tile_height as f32,
+                        density: content.population / (chunk_area * 4096.0),
+                    }];
+                }
+                let changed = tile.update(cx, |view, _| view.replace(content.items));
+                if changed {
+                    updated_tiles += 1;
+                    tile.update(cx, |_, tile_cx| tile_cx.notify());
+                }
+                self.tile_content_keys.insert(*tile_coord, content_key);
             }
+            paint_items += tile.read(cx).item_count();
             active.push(
                 div()
                     .absolute()
@@ -367,6 +492,15 @@ impl AppView {
         }
 
         self.tile_views.retain(|coord, _| desired.contains(coord));
+        self.tile_content_keys
+            .retain(|coord, _| desired.contains(coord));
+        self.dirty_chunks.retain(|&(chunk_x, chunk_y)| {
+            !desired.contains(&RenderTileCoord {
+                x: chunk_x.div_euclid(plan.chunks_per_tile),
+                y: chunk_y.div_euclid(plan.chunks_per_tile),
+            })
+        });
+        self.invalidate_all_tiles = false;
         self.render_stats = RenderStats {
             visible_chunks,
             tile_views: self.tile_views.len(),
@@ -381,6 +515,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        cx.on_next_frame(window, |view, _, _| view.record_frame_completion());
         let viewport_size = window.viewport_size();
         let width = f64::from(viewport_size.width);
         let height = (f64::from(viewport_size.height) - TOOLBAR_HEIGHT).max(1.0);
@@ -391,6 +526,7 @@ impl Render for AppView {
         let (painted_items, paint_time) = crate::tile_view::take_paint_metrics();
         let estimated_bytes =
             self.world.chunk_count() * (size_of::<Chunk>() + size_of::<crate::ChunkCoord>() + 32);
+        self.record_metrics(stats, painted_items, paint_time, estimated_bytes);
 
         div()
             .size_full()
@@ -452,6 +588,11 @@ impl Render for AppView {
                                 "speed-up",
                                 "+",
                                 cx.listener(|this, _, _, cx| this.change_speed(true, cx)),
+                            ))
+                            .child(control_button(
+                                "export-metrics",
+                                "CSV",
+                                cx.listener(|this, _, _, cx| this.export_metrics(cx)),
                             )),
                     )
                     .child(
@@ -469,7 +610,8 @@ impl Render for AppView {
                                     .flex()
                                     .items_center()
                                     .child(format!(
-                                        "sim {:.2} ms / 候補 {} | 表示 {} | View {} | 更新 {} | items {}",
+                                        "UI FPS {:.1} | sim {:.2} ms / 候補 {} | 表示 {} | View {} | 更新 {} | items {}",
+                                        self.frame_rate,
                                         self.generation_stats.elapsed.as_secs_f64() * 1000.0,
                                         self.generation_stats.candidate_chunks,
                                         stats.visible_chunks,
@@ -544,6 +686,73 @@ impl Render for AppView {
                     .children(tiles),
             )
     }
+}
+
+impl AppView {
+    fn record_metrics(
+        &mut self,
+        stats: RenderStats,
+        painted_items: usize,
+        paint_time: Duration,
+        estimated_bytes: usize,
+    ) {
+        if self.metric_samples.len() == MAX_METRIC_SAMPLES {
+            self.metric_samples.pop_front();
+        }
+        self.metric_samples.push_back(MetricSample {
+            elapsed_ms: self.metrics_started_at.elapsed().as_secs_f64() * 1000.0,
+            frame_rate: self.frame_rate,
+            generation: self.generation,
+            origin_x: self.camera.origin_cell().x,
+            origin_y: self.camera.origin_cell().y,
+            cell_size: self.camera.cell_size(),
+            sim_ms: self.generation_stats.elapsed.as_secs_f64() * 1000.0,
+            candidate_chunks: self.generation_stats.candidate_chunks,
+            visible_chunks: stats.visible_chunks,
+            tile_views: stats.tile_views,
+            updated_tiles: stats.updated_tiles,
+            paint_items: stats.paint_items,
+            painted_items,
+            paint_ms: paint_time.as_secs_f64() * 1000.0,
+            prepare_ms: stats.prepare_time.as_secs_f64() * 1000.0,
+            delayed_generations: stats.delayed_generations,
+            world_chunks: self.world.chunk_count(),
+            estimated_bytes,
+        });
+    }
+}
+
+fn write_metrics_csv(path: &std::path::Path, samples: &[MetricSample]) -> std::io::Result<()> {
+    let mut csv = String::from(
+        "elapsed_ms,ui_fps,generation,camera_origin_x,camera_origin_y,cell_size,sim_ms,candidate_chunks,visible_chunks,tile_views,updated_tiles,paint_items,painted_items,paint_ms,prepare_ms,delayed_generations,world_chunks,estimated_bytes\n",
+    );
+    for sample in samples {
+        use std::fmt::Write as _;
+        writeln!(
+            csv,
+            "{:.3},{:.1},{},{},{},{:.5},{:.3},{},{},{},{},{},{},{:.3},{:.3},{},{},{}",
+            sample.elapsed_ms,
+            sample.frame_rate,
+            sample.generation,
+            sample.origin_x,
+            sample.origin_y,
+            sample.cell_size,
+            sample.sim_ms,
+            sample.candidate_chunks,
+            sample.visible_chunks,
+            sample.tile_views,
+            sample.updated_tiles,
+            sample.paint_items,
+            sample.painted_items,
+            sample.paint_ms,
+            sample.prepare_ms,
+            sample.delayed_generations,
+            sample.world_chunks,
+            sample.estimated_bytes,
+        )
+        .expect("writing a CSV row to a String cannot fail");
+    }
+    std::fs::write(path, csv)
 }
 
 fn control_button(
@@ -640,12 +849,12 @@ impl TileContent {
         } else if cell_size >= 0.125 {
             for block_y in 0..16_u8 {
                 for block_x in 0..16_u8 {
-                    let mut population = 0_u32;
-                    for local_y in block_y * 4..block_y * 4 + 4 {
-                        for local_x in block_x * 4..block_x * 4 + 4 {
-                            population += u32::from(chunk.get(local_x, local_y));
-                        }
-                    }
+                    let shift = u32::from(block_x) * 4;
+                    let population: u32 = chunk.rows()
+                        [usize::from(block_y) * 4..usize::from(block_y) * 4 + 4]
+                        .iter()
+                        .map(|row| ((row >> shift) & 0x0f).count_ones())
+                        .sum();
                     if population > 0 {
                         let span = 4.0 * cell_size as f32;
                         content.items.push(PaintItem {

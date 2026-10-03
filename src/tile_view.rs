@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Context, IntoElement, ParentElement, Render, Styled, Window, canvas, div, fill, point, px, rgb,
-    size,
+    Context, IntoElement, ParentElement, PathBuilder, Render, Styled, Window, canvas, div, point,
+    px, rgb,
 };
 
 static PAINTED_ITEMS: AtomicUsize = AtomicUsize::new(0);
@@ -27,43 +29,55 @@ pub(crate) struct PaintItem {
 
 #[derive(Default)]
 pub struct TileView {
-    items: Vec<PaintItem>,
+    items: Arc<[PaintItem]>,
 }
 
 impl TileView {
+    pub(crate) fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
     pub(crate) fn replace(&mut self, items: Vec<PaintItem>) -> bool {
-        if self.items == items {
+        if self.items.as_ref() == items.as_slice() {
             return false;
         }
-        self.items = items;
+        self.items = Arc::from(items);
         true
     }
 }
 
 impl Render for TileView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.items.clone();
+        let items = Arc::clone(&self.items);
         div().size_full().child(
             canvas(
                 |_, _, _| (),
                 move |bounds, (), window, _| {
                     let started = Instant::now();
                     let item_count = items.len();
-                    for item in items {
+                    let mut paths = BTreeMap::new();
+                    for item in items.iter() {
                         let density = item.density.clamp(0.0, 1.0);
                         let red = (17.0 + 55.0 * density) as u32;
                         let green = (24.0 + 181.0 * density) as u32;
                         let blue = (39.0 + 145.0 * density) as u32;
-                        window.paint_quad(fill(
-                            gpui::Bounds {
-                                origin: point(
-                                    bounds.origin.x + px(item.x),
-                                    bounds.origin.y + px(item.y),
-                                ),
-                                size: size(px(item.width), px(item.height)),
-                            },
-                            rgb((red << 16) | (green << 8) | blue),
-                        ));
+                        let path = paths
+                            .entry((red << 16) | (green << 8) | blue)
+                            .or_insert_with(PathBuilder::fill);
+                        let left = bounds.origin.x + px(item.x);
+                        let top = bounds.origin.y + px(item.y);
+                        let right = left + px(item.width);
+                        let bottom = top + px(item.height);
+                        path.move_to(point(left, top));
+                        path.line_to(point(right, top));
+                        path.line_to(point(right, bottom));
+                        path.line_to(point(left, bottom));
+                        path.close();
+                    }
+                    for (color, path_builder) in paths {
+                        if let Ok(path) = path_builder.build() {
+                            window.paint_path(path, rgb(color));
+                        }
                     }
                     PAINTED_ITEMS.fetch_add(item_count, Ordering::Relaxed);
                     PAINT_TIME_NANOS.fetch_add(

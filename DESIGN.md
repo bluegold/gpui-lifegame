@@ -264,6 +264,8 @@ struct TileView {
 
 TileView はセルごとの子要素を作らず、GPUI Canvas の paint callback で生存セルを直接描きます。
 
+描画コマンド数を抑えるため、同じ色の矩形をタイルごとに一つの Path にまとめて描きます。TileView が表示する内容はタイル単位でキャッシュし、世代差分が触れたタイルだけ内容を作り直します。ズーム倍率や集約粒度が変わった場合は、必要な表示タイルを再計算します。
+
 GPUI は公式 crates.io の最新安定版を使います。2026-10-02 時点では `gpui = "=0.2.2"` とし、Cargo.lock をコミットして依存解決を固定します。ルート View はフレームごとに render されるため、チャンク表示には安定した Entity として保持する TileView を使い、表示範囲と overscan に含まれるタイルだけを保持します。パンで位置だけが変わった場合はルート View が配置を更新し、セル内容が変わった TileView だけを notify します。TileView は子要素としてセルを作らず、Canvas の paint callback で生存セル、4 x 4 ブロック、またはチャンク密度を描きます。GPUI の Entity、View、Element の役割は[公式 README](https://github.com/zed-industries/zed/blob/main/crates/gpui/README.md)と[Context の説明](https://github.com/zed-industries/zed/blob/main/crates/gpui/docs/contexts.md)に従います。
 
 ```text
@@ -593,7 +595,7 @@ if next_chunk.is_empty() {
 
 ### 描画
 
-表示中のチャンク数と変更されたチャンク数、フレームごとの TileView の描画回数と生存セル数、描画時間、表示の遅延回数を計測します。
+表示中のチャンク数と変更されたチャンク数、フレームごとの TileView の描画回数と生存セル数、UI FPS、描画時間、表示の遅延回数を計測します。
 
 ### メモリ
 
